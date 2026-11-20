@@ -3,16 +3,17 @@
     <header class="page-head">
       <div>
         <h2>采集监控管理</h2>
-        <p class="page-desc">维护监控面板，围绕面板编号、采集源总数、今日采集量、成功率做登记、筛选与状态流转。</p>
+        <p class="page-desc">维护监控面板，并由采集故障明细登记告警；告警保留对应日志组与本次严重程度。</p>
       </div>
       <div class="page-actions">
         <button class="btn primary" type="button" @click="openCreate">登记监控面板</button>
+        <button class="btn" type="button" @click="generateAlerts">按故障生成告警</button>
         <button class="btn" type="button" @click="exportRows">导出采集监控清单</button>
       </div>
     </header>
 
     <div class="stat-row">
-      <article v-for="item in stats" :key="item.label" class="stat-card">
+      <article v-for="item in statValues" :key="item.label" class="stat-card">
         <span class="stat-label">{{ item.label }}</span>
         <strong class="stat-value">{{ item.value }}</strong>
       </article>
@@ -57,8 +58,57 @@
 
     <footer class="page-foot">
       <span>共 {{ total }} 条采集监控记录</span>
+      <span v-if="message" class="ok-text">{{ message }}</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <section class="sub-section">
+      <header class="sub-head">
+        <div>
+          <h3>采集告警记录</h3>
+          <p class="page-desc">一条采集故障对应一张告警；关闭只影响该告警自己的故障，同任务其他未处置故障仍会提示继续接单。</p>
+        </div>
+        <span class="sub-tip">待领取 {{ pendingAlerts }} 条 · 未关闭 {{ openAlerts }} 条</span>
+      </header>
+
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th v-for="column in alertColumns" :key="column">{{ column }}</th>
+            <th>日志组</th>
+            <th>同任务未处置</th>
+            <th>可执行动作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="alert in alerts" :key="String(alert.id)">
+            <td v-for="column in alertColumns" :key="column" :title="String(alert[column] ?? '')">
+              {{ formatCell(alert[column]) }}
+            </td>
+            <td>{{ (alert['日志组'] as string[] | undefined)?.join('、') || '—' }}</td>
+            <td>{{ formatOpenFaults(alert) }}</td>
+            <td class="row-actions">
+              <button
+                v-for="action in alertActions"
+                :key="action"
+                class="link"
+                type="button"
+                @click="runAlertAction(action, alert)"
+              >
+                {{ action }}
+              </button>
+            </td>
+          </tr>
+          <tr v-if="!alerts.length">
+            <td :colspan="alertColumns.length + 3" class="empty-state">暂无采集告警，可先按故障生成告警</td>
+          </tr>
+        </tbody>
+      </table>
+      <footer class="page-foot">
+        <span>共 {{ alertTotal }} 条告警记录</span>
+        <span v-if="alertMessage" class="ok-text">{{ alertMessage }}</span>
+      </footer>
+    </section>
 
     <Teleport to="body">
       <div v-if="showCreateModal" class="modal-overlay" @click.self="showCreateModal = false">
@@ -88,27 +138,51 @@ import { onMounted, ref } from 'vue'
 
 import { request } from '@/api/client'
 
-type Row = Record<string, string | number | null>
+type Row = Record<string, unknown>
+type AlertRow = Record<string, unknown> & { 同任务未处置?: { 故障编号?: string; 当前级别?: string; 重复次数?: number }[] }
 
 const ENDPOINT = '/api/monitor'
+const ALERT_ENDPOINT = '/api/monitor/alerts'
 const columns = ["面板编号", "采集源总数", "今日采集量", "成功率", "平均延迟", "失败重试", "异常告警", "更新时间"]
 const actions = ["查看详情"]
-const statuses = ["正常", "预警", "告警"]
-const stats = [{"label": "今日采集量", "value": 0}, {"label": "成功率", "value": 0}, {"label": "异常告警数", "value": 0}]
+const alertColumns = ["告警编号", "关联任务", "故障编号", "本次严重程度", "重复次数", "告警状态", "领取人"]
+const alertActions = ["领取告警", "关闭告警", "忽略告警"]
+const statValues = ref([{"label": "待领取告警", "value": 0}, {"label": "未关闭告警", "value": 0}, {"label": "告警总数", "value": 0}])
 
 const rows = ref<Row[]>([])
 const total = ref(0)
+const alerts = ref<AlertRow[]>([])
+const alertTotal = ref(0)
+const pendingAlerts = ref(0)
+const openAlerts = ref(0)
 const errorMessage = ref('')
+const message = ref('')
+const alertMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
 const showCreateModal = ref(false)
 const createFields = ref<Record<string, string>>({})
 
+function formatCell(value: unknown) {
+  if (value === null || value === undefined || value === '') return '—'
+  const text = String(value)
+  return text.length > 40 ? `${text.slice(0, 40)}…` : text
+}
+
+function formatOpenFaults(alert: AlertRow) {
+  const items = alert['同任务未处置'] ?? []
+  if (!items.length) return '无'
+  return items
+    .map((item) => `${item.故障编号 ?? '—'}(${item.当前级别 ?? '—'}，${item.重复次数 ?? 0} 次)`)
+    .join('、')
+}
+
 function updateStats() {
-  const data = rows.value
-  stats.length > 0 && (stats[0].value = data.filter((r: Row) => r.status === statuses[1] || r.pending).length)
-  stats.length > 1 && (stats[1].value = data.filter((r: Row) => r.status && !r.pending && !r.abnormal).length)
-  stats.length > 2 && (stats[2].value = data.filter((r: Row) => r.abnormal).length)
+  pendingAlerts.value = alerts.value.filter((item) => item['告警状态'] === '待领取').length
+  openAlerts.value = alerts.value.filter((item) => item['告警状态'] !== '已关闭' && item['告警状态'] !== '已忽略').length
+  statValues.value[0].value = pendingAlerts.value
+  statValues.value[1].value = openAlerts.value
+  statValues.value[2].value = alertTotal.value
 }
 
 function resetFilters() {
@@ -128,15 +202,17 @@ function openCreate() {
 
 async function submitCreate() {
   errorMessage.value = ''
+  message.value = ''
   try {
     const response = await request(ENDPOINT, {
       method: 'POST',
       body: JSON.stringify({ values: createFields.value }),
     })
-    if (!response.ok) {
-      const data = await response.json()
+    const data = await response.json()
+    if (!response.ok || !data.ok) {
       throw new Error(data.message || '登记失败')
     }
+    message.value = data.message ?? '监控面板已登记'
     showCreateModal.value = false
     await reload()
   } catch (error) {
@@ -146,17 +222,55 @@ async function submitCreate() {
 
 async function runAction(action: string, row: Row) {
   errorMessage.value = ''
+  message.value = ''
   try {
     const response = await request(`${ENDPOINT}/${row.id}/actions`, {
       method: 'POST',
       body: JSON.stringify({ values: { action } }),
     })
-    if (!response.ok) {
-      throw new Error('采集监控动作未生效，请稍后重试')
+    const data = await response.json()
+    if (!response.ok || !data.ok) {
+      throw new Error(data.message || '采集监控动作未生效，请稍后重试')
     }
+    message.value = data.message
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '采集监控操作失败'
+  }
+}
+
+async function runAlertAction(action: string, alert: AlertRow) {
+  alertMessage.value = ''
+  errorMessage.value = ''
+  try {
+    const response = await request(`${ALERT_ENDPOINT}/${alert.id}/actions`, {
+      method: 'POST',
+      body: JSON.stringify({ values: { action } }),
+    })
+    const data = await response.json()
+    if (!response.ok || !data.ok) {
+      throw new Error(data.message || '告警动作未生效，请稍后重试')
+    }
+    alertMessage.value = data.message
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '采集告警操作失败'
+  }
+}
+
+async function generateAlerts() {
+  alertMessage.value = ''
+  errorMessage.value = ''
+  try {
+    const response = await request(`${ALERT_ENDPOINT}/generate`, { method: 'POST' })
+    const data = await response.json()
+    if (!response.ok || !data.ok) {
+      throw new Error(data.message || '告警生成失败')
+    }
+    alertMessage.value = data.message
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '告警生成失败'
   }
 }
 
@@ -164,13 +278,22 @@ async function reload() {
   errorMessage.value = ''
   const query = new URLSearchParams(filters.value as Record<string, string>).toString()
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
-    if (!response.ok) {
+    const [panelResponse, alertResponse] = await Promise.all([
+      request(`${ENDPOINT}?${query}`),
+      request(`${ALERT_ENDPOINT}?size=200`),
+    ])
+    if (!panelResponse.ok) {
       throw new Error('监控面板列表读取失败')
     }
-    const payload = await response.json()
+    if (!alertResponse.ok) {
+      throw new Error('采集告警列表读取失败')
+    }
+    const payload = await panelResponse.json()
+    const alertPayload = await alertResponse.json()
     rows.value = payload.items ?? []
     total.value = payload.total ?? rows.value.length
+    alerts.value = alertPayload.items ?? []
+    alertTotal.value = alertPayload.total ?? alerts.value.length
     updateStats()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '采集监控列表读取失败'
